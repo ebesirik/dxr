@@ -1,5 +1,7 @@
 #[cfg(feature = "multicall")]
 use std::collections::HashMap;
+use std::fmt::Debug;
+use std::path::Path;
 
 use http::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE, USER_AGENT};
 use thiserror::Error;
@@ -10,6 +12,21 @@ use dxr::Value;
 use dxr::{DxrError, Fault, FaultResponse, MethodCall, MethodResponse, TryFromValue, TryToParams};
 
 use crate::{Call, DEFAULT_USER_AGENT};
+
+use std::net::ToSocketAddrs;
+use tokio::net::{TcpStream, UnixStream};
+use tokio_scgi::client::{SCGICodec, SCGIRequest};
+use tokio_util::codec::Framed;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use std::io::{Error, ErrorKind};
+use std::io::prelude::*;
+use std::ops::Add;
+use log::error;
+use bytes::{BufMut, BytesMut};
+use futures::{SinkExt, StreamExt};
+use http::request;
+use std::rc::Rc;
+
 
 /// Error type for XML-RPC clients based on [`reqwest`].
 #[derive(Debug, Error)]
@@ -122,12 +139,136 @@ impl Client {
         let request = call.as_xml_rpc()?;
         let body = request_to_body(&request)?;
 
-        // construct request and send to server
-        let request = self.client.post(self.url.clone()).body(body).build()?;
-        let response = self.client.execute(request).await?;
+        let response = match self.url.clone().scheme() {
+            "unix" => {
+                let path = Path::new(self.url.path());
+                let req = SCGIRequest::Request (
+                    vec![
+                        ("CONTENT_LENGTH".to_owned(), body.len().to_string().to_owned()),
+                        ("SCGI".to_owned(), "1".to_owned()),
+                        ("REQUEST_METHOD".to_owned(), "POST".to_owned()),
+                        ("REQUEST_URI".to_owned(), "/RPC".to_owned()),
+                    ],
+                    BytesMut::from(body.as_bytes())
+                );
 
+                match send_scgi_request(self.url.path(), req).await {
+                    Ok(mut stream) => {
+                        /*stream.write_all(body.as_bytes()).unwrap();
+                        let mut buf = String::new();
+                        stream.read_to_string(&mut buf).unwrap();
+                        buf*/
+                        // println!("Response: {:?}", stream);
+                        stream
+                    }
+                    Err(e) => {
+                        eprintln!("Raw Error OS Code: {:?}", e.raw_os_error());
+                        eprintln!("Failed to connect to rtorrent socket: {:?}", e);
+                        return Err(ClientError::Fault { fault: Fault::new(1, "Failed to connect to rtorrent socket".to_string())});
+                    }
+                }
+            }
+            _ => {
+                // let request = self.client.post(self.url.clone()).body(body).build()?;
+                let request = match self.client.post(self.url.clone()).body(body).build() {
+                    Ok(request) => request,
+                    Err(e) => {
+                        eprintln!("Failed to build the request: {:?}", e);
+                        return Err(ClientError::Net { error: e });
+                    }
+                };
+                self.client.execute(request).await?.text().await?
+            }
+        };
+        // construct request and send to server
+
+        use std::io::prelude::*;
+
+        async fn send_scgi_request(socket_path: &str, request: SCGIRequest) -> std::io::Result<String> {
+            // Connect to the SCGI server
+            let addr = Path::new(socket_path);
+            let mut client = UnixStream::connect(&addr).await?;
+            let mut framed = Framed::new(client, SCGICodec::new());
+            // Send request
+            framed.send(request).await?;
+
+            let mut none_count = 0;
+            let mut some_count = 0;
+            let mut err_count = 0;
+            let mut resp = String::new();
+
+            loop {
+                match framed.next().await {
+                    None => {
+                        // SCGI response not ready: loop for more rx data
+                        // Shouldn't happen for response data, but this is how it would work...
+                        none_count += 1;
+                        eprintln!("Response data is incomplete, resuming read");
+                    }
+                    Some(Err(e)) => {
+                        err_count += 1;
+                        // RX error: return error and abort
+                        return Err(Error::new(
+                            ErrorKind::Other,
+                            format!("Error when waiting for response: {}", e),
+                        ));
+                    }
+                    Some(Ok(response)) => {
+                        // Got SCGI response: if empty, treat as end of response.
+                        some_count += 1;
+                        if response.len() == 0 {
+                            break;
+                        }
+                        let mut res = response.to_owned();
+                        match tokio_util::codec::Decoder::decode(&mut SCGICodec::new(), &mut res){
+                            Ok(Some(s)) => {
+                                match String::from_utf8(response.to_vec()) {
+                                    Ok(s) => {
+                                        //remove text until <?xml version="1.0" encoding="UTF-8"?> to fix invalid xml
+                                        let mut s2 = s.split("<?xml").collect::<Vec<&str>>()[1].to_owned();
+                                        &s2.insert_str(0, "<?xml");
+                                        //println!("Got response: {}", s);
+                                        /*println!("Got response: {}", s);
+                                        resp.push_str(s.as_str());*/
+                                        // println!("Got response: {}", s2);
+                                        resp.push_str(s2.as_str());
+                                    },
+                                    Err(e) => {
+                                        eprintln!(
+                                            "{} byte response is not UTF8 ({}):\n{:?}",
+                                            response.len(),
+                                            e,
+                                            response
+                                        );
+                                    },
+                                }
+                            },
+                            Err(e) => {
+                                eprintln!(
+                                    "{} byte response is not UTF8 ({}):\n{:?}",
+                                    response.len(),
+                                    e,
+                                    response
+                                );
+                            },
+                            Ok(None) => {
+                                eprintln!("Response data is incomplete, resuming read");
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok(resp)
+        }
+        /*
+        CONTENT_LENGTH 179
+        SCGI 1
+        REQUEST_METHOD POST
+        REQUEST_URI /RPC
+        */
         // deserialize XML-RPC method response
-        let contents = response.text().await?;
+        let contents = response;
         let result = response_to_result(&contents)?;
 
         // extract return value
@@ -148,7 +289,7 @@ impl Client {
         let mut results = Vec::new();
         for result in response {
             // return values for successful calls are arrays that contain a single value
-            if let Ok((value,)) = <(Value,)>::try_from_value(&result) {
+            if let Ok((value, )) = <(Value, )>::try_from_value(&result) {
                 results.push(Ok(value));
             };
 
@@ -185,7 +326,7 @@ fn request_to_body(call: &MethodCall) -> Result<String, DxrError> {
             .as_str(),
         "",
     ]
-    .join("\n");
+        .join("\n");
 
     Ok(body)
 }
@@ -203,7 +344,7 @@ fn response_to_result(contents: &str) -> Result<MethodResponse, ClientError> {
                 // malformed server fault: return DxrError
                 Err(error) => Err(error.into()),
             };
-        },
+        }
         Err(error) => error.to_string(),
     };
 

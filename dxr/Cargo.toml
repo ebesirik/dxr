@@ -34,7 +34,7 @@ trybuild = "1"
 [features]
 # support for derive macros
 derive =["dep:dxr_derive"]
-
+#default = ["i8"]
 # utilities for multicall support
 multicall = []
 
