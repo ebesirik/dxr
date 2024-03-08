@@ -1,32 +1,30 @@
 #[cfg(feature = "multicall")]
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::path::Path;
-
-use http::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE, USER_AGENT};
-use thiserror::Error;
-use url::Url;
-
-#[cfg(feature = "multicall")]
-use dxr::Value;
-use dxr::{DxrError, Fault, FaultResponse, MethodCall, MethodResponse, TryFromValue, TryToParams};
-
-use crate::{Call, DEFAULT_USER_AGENT};
-
+use std::io::{Error, ErrorKind};
+use std::io::prelude::*;
 use std::net::ToSocketAddrs;
+use std::ops::Add;
+use std::path::Path;
+use std::rc::Rc;
+
+use bytes::{BufMut, BytesMut};
+use futures::{SinkExt, StreamExt};
+use http::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT};
+use http::request;
+use log::error;
+use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
 use tokio_scgi::client::{SCGICodec, SCGIRequest};
 use tokio_util::codec::Framed;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use std::io::{Error, ErrorKind};
-use std::io::prelude::*;
-use std::ops::Add;
-use log::error;
-use bytes::{BufMut, BytesMut};
-use futures::{SinkExt, StreamExt};
-use http::request;
-use std::rc::Rc;
+use url::Url;
 
+use dxr::{DxrError, Fault, FaultResponse, MethodCall, MethodResponse, TryFromValue, TryToParams};
+#[cfg(feature = "multicall")]
+use dxr::Value;
+
+use crate::{Call, DEFAULT_USER_AGENT};
 
 /// Error type for XML-RPC clients based on [`reqwest`].
 #[derive(Debug, Error)]
